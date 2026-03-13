@@ -1,53 +1,4 @@
 # Art Director AI
-```
-
-That ` ````md ` should **not** be inside the README file itself unless you’re showing the README as code somewhere else.
-
-The actual file should start simply with:
-
-```md
-# Art Director AI
-```
-
-And it should end normally, without extra closing backticks.
-
-## Small wording improvement
-I’d change this:
-
-- **“professional art-direction feedback”**
-
-to:
-
-- **“art-direction feedback”**
-
-Because “professional” can sound like a claim judges may mentally test harder than necessary.
-
-So this intro becomes:
-
-```md
-It reviews textured 3D assets through **live voice + screen sharing**, provides art-direction feedback in real time, and generates a detailed review report with **PDF export** when the session is finished.
-```
-
-## Optional stronger note for judges
-Under **Live Demo**, I’d add one line:
-
-```md
-> Best experienced on desktop Chrome with microphone and screen-sharing permissions enabled.
-```
-
-That helps judges avoid confusion immediately.
-
-## My verdict
-For the form question:
-
-**Did you add Reproducible Testing instructions to your README?**  
-Answer: **Yes**
-
-## Final cleaned README
-Use this as the actual file content:
-
-```md
-# Art Director AI
 
 **Art Director AI** is a live AI art director for 3D game artists.
 
@@ -355,5 +306,3 @@ The frontend is deployed to **Google Cloud Run** from source.
 - **Google Secret Manager**
 - **Google Cloud Build**
 ```
-
-If you want, next I’d focus on the **architecture diagram text**, because that’s probably the most important missing submission asset.
