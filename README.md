@@ -284,7 +284,7 @@ Cloud Run is configured with:
 
 ### Frontend
 
-The frontend is deployed to **Google Cloud Run** from source.
+The frontend is deployed to **Google Cloud Run** from source..
 
 ## Notes
 
