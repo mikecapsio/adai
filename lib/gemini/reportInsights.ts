@@ -1,10 +1,10 @@
-import { TEST_PROMPT_MODEL } from "../../config/env";
 import { getGeminiClient } from "./client";
+import { REPORT_MODEL } from "./models";
 import type {
   LiveReviewFinding,
   LiveReviewSessionState,
   ReviewTranscriptItem,
-} from "./liveSession";
+} from "./types";
 
 type ReportInsightScreenshot = {
   id: string;
@@ -210,20 +210,23 @@ function buildInsightRequestText(input: {
  * This keeps the report pipeline deterministic and lets the final report
  * prompt work from explicit findings instead of only raw transcript text.
  */
-export async function extractReportInsights(input: {
-  transcript: ReviewTranscriptItem[];
-  screenshots: ReportInsightScreenshot[];
-  sessionState: Pick<
-    LiveReviewSessionState,
-    | "assetName"
-    | "assetType"
-    | "styleTarget"
-    | "reviewedParts"
-    | "visibilityLimitations"
-    | "findings"
-  >;
-}) {
-  const ai = getGeminiClient();
+export async function extractReportInsights(
+  input: {
+    transcript: ReviewTranscriptItem[];
+    screenshots: ReportInsightScreenshot[];
+    sessionState: Pick<
+      LiveReviewSessionState,
+      | "assetName"
+      | "assetType"
+      | "styleTarget"
+      | "reviewedParts"
+      | "visibilityLimitations"
+      | "findings"
+    >;
+  },
+  apiKey: string,
+) {
+  const ai = getGeminiClient(apiKey);
   const parts: Array<{
     text?: string;
     inlineData?: {
@@ -252,7 +255,7 @@ export async function extractReportInsights(input: {
   }
 
   const response = await ai.models.generateContent({
-    model: TEST_PROMPT_MODEL,
+    model: REPORT_MODEL,
     contents: [
       {
         role: "user",

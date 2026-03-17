@@ -1,0 +1,19 @@
+# dependencies
+node_modules
+
+# next.js build output
+.next
+
+# git
+.git
+.gitignore
+
+# env files — inject via Coolify environment variables, never bake into image
+.env
+.env.*
+
+# misc
+.claude
+README.md
+NOTICE.md
+*.tsbuildinfo

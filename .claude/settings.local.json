@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:ai.google.dev)",
+      "WebFetch(domain:docs.cloud.google.com)",
+      "WebFetch(domain:firebase.google.com)",
+      "WebFetch(domain:github.com)",
+      "Bash(grep -r \"contextWindowCompression\\\\|ContextWindowCompression\\\\|slidingWindow\" e:/NodeJS_Workspace/adaiapp/node_modules/@google/genai/dist --include=*.d.ts -l)",
+      "Bash(npx tsc:*)",
+      "Bash(ls -la /e/NodeJS_Workspace/adaiapp/app/api/live/[id]/)",
+      "Bash(rm -rf app/api)",
+      "Bash(rm -f lib/gemini/liveSession.ts lib/gemini/service.ts lib/config/env.ts)",
+      "Bash(timeout 15 npx next build)"
+    ]
+  }
+}
