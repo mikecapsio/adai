@@ -1,4 +1,4 @@
-import type { LiveReviewFinding, ReviewTranscriptItem } from "./liveSession";
+import type { LiveReviewFinding, ReviewTranscriptItem } from "./types";
 
 export type CuratedLearningResource = {
   id: string;

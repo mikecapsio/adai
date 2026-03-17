@@ -1,10 +1,10 @@
-import { TEST_PROMPT_MODEL } from "../../config/env";
 import { getGeminiClient } from "./client";
+import { REPORT_MODEL } from "./models";
 import type {
   LiveReviewFinding,
   LiveReviewSessionState,
   ReviewTranscriptItem,
-} from "./liveSession";
+} from "./types";
 import {
   lookupGroundedLearningResources,
   type GroundedLearningResource,
@@ -178,11 +178,19 @@ export function buildReportPromptPayload(
  * The transcript and review metadata come from backend memory, while
  * screenshots are attached as optional image references for the report pass.
  */
-export async function generateReviewReport(input: ReportGenerationInput) {
-  const ai = getGeminiClient();
+export async function generateReviewReport(input: ReportGenerationInput, apiKey: string) {
+  const ai = getGeminiClient(apiKey);
   const transcriptMessages = input.sessionState.transcript.filter(
     (message) => message.role === "user" || message.role === "assistant",
   );
+  const emptyInsights: ExtractedReportInsights = {
+    assetName: null,
+    assetType: null,
+    styleTarget: null,
+    reviewedParts: [],
+    visibilityLimitations: [],
+    findings: [],
+  };
   const extractedInsights = await extractReportInsights({
     transcript: transcriptMessages,
     screenshots: input.screenshots,
@@ -194,38 +202,41 @@ export async function generateReviewReport(input: ReportGenerationInput) {
       visibilityLimitations: input.sessionState.visibilityLimitations,
       findings: input.sessionState.findings,
     },
+  }, apiKey).catch((error) => {
+    console.error("[report] extractReportInsights failed, using empty fallback:", error);
+    return emptyInsights;
+  });
+  const resourceCatalog = await lookupGroundedLearningResources({
+    assetName:
+      input.sessionState.assetName ||
+      extractedInsights.assetName ||
+      getOptionalStringValue(input.assetMetadata, "assetName"),
+    assetType:
+      input.sessionState.assetType ||
+      extractedInsights.assetType ||
+      getOptionalStringValue(input.assetMetadata, "assetType") ||
+      "3D game asset",
+    styleTarget:
+      input.styleTarget ||
+      input.sessionState.styleTarget ||
+      extractedInsights.styleTarget ||
+      getOptionalStringValue(input.assetMetadata, "styleTarget"),
+    findings:
+      input.sessionState.findings.length > 0
+        ? input.sessionState.findings
+        : extractedInsights.findings,
+    reviewedParts:
+      input.sessionState.reviewedParts.length > 0
+        ? input.sessionState.reviewedParts
+        : extractedInsights.reviewedParts,
+    transcript: transcriptMessages,
+  }, apiKey).catch((error) => {
+    console.error("[report] lookupGroundedLearningResources failed, using empty catalog:", error);
+    return [];
   });
   const promptPayload = buildReportPromptPayload(input, {
     extractedInsights,
-    resourceCatalog: await lookupGroundedLearningResources({
-      assetName:
-        input.sessionState.assetName ||
-        extractedInsights.assetName ||
-        getOptionalStringValue(input.assetMetadata, "assetName"),
-      assetType:
-        input.sessionState.assetType ||
-        extractedInsights.assetType ||
-        getOptionalStringValue(input.assetMetadata, "assetType") ||
-        "3D game asset",
-      styleTarget:
-        input.styleTarget ||
-        input.sessionState.styleTarget ||
-        extractedInsights.styleTarget ||
-        getOptionalStringValue(input.assetMetadata, "styleTarget"),
-      findings:
-        input.sessionState.findings.length > 0
-          ? input.sessionState.findings
-          : extractedInsights.findings,
-      reviewedParts:
-        input.sessionState.reviewedParts.length > 0
-          ? input.sessionState.reviewedParts
-          : extractedInsights.reviewedParts,
-      visibilityLimitations:
-        input.sessionState.visibilityLimitations.length > 0
-          ? input.sessionState.visibilityLimitations
-          : extractedInsights.visibilityLimitations,
-      transcript: transcriptMessages,
-    }),
+    resourceCatalog,
   });
   const parts: Array<{
     text?: string;
@@ -264,7 +275,7 @@ export async function generateReviewReport(input: ReportGenerationInput) {
   }
 
   const response = await ai.models.generateContent({
-    model: TEST_PROMPT_MODEL,
+    model: REPORT_MODEL,
     contents: [
       {
         role: "user",
@@ -277,7 +288,7 @@ export async function generateReviewReport(input: ReportGenerationInput) {
     markdown:
       response.text?.trim() ||
       "# Art Director AI Review Report\n\nGemini returned an empty report.",
-    model: TEST_PROMPT_MODEL,
+    model: REPORT_MODEL,
     promptPayload,
     extractedInsights,
   };

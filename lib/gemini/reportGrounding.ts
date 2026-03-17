@@ -1,6 +1,6 @@
-import { TEST_PROMPT_MODEL } from "../../config/env";
 import { getGeminiClient } from "./client";
-import type { LiveReviewFinding, ReviewTranscriptItem } from "./liveSession";
+import { REPORT_MODEL } from "./models";
+import type { LiveReviewFinding, ReviewTranscriptItem } from "./types";
 
 export type GroundedLearningResource = {
   title: string;
@@ -350,19 +350,21 @@ function buildGroundedSelectionPrompt(input: {
  * The final resources are selected only from grounded search results so the
  * report no longer falls back to the previous static tutorial list.
  */
-export async function lookupGroundedLearningResources(input: {
-  assetName: string | null;
-  assetType: string;
-  styleTarget: string | null;
-  findings: LiveReviewFinding[];
-  reviewedParts: string[];
-  visibilityLimitations: string[];
-  transcript: ReviewTranscriptItem[];
-}) {
+export async function lookupGroundedLearningResources(
+  input: {
+    assetName: string | null;
+    assetType: string;
+    styleTarget: string | null;
+    findings: LiveReviewFinding[];
+    reviewedParts: string[];
+    transcript: ReviewTranscriptItem[];
+  },
+  apiKey: string,
+) {
   try {
-    const ai = getGeminiClient();
+    const ai = getGeminiClient(apiKey);
     const searchResponse = await ai.models.generateContent({
-      model: TEST_PROMPT_MODEL,
+      model: REPORT_MODEL,
       contents: buildGroundedSearchPrompt(input),
       config: {
         tools: [{ googleSearch: {} }],
@@ -384,7 +386,7 @@ export async function lookupGroundedLearningResources(input: {
       groundedCandidateResources.map((resource) => resource.url),
     );
     const selectionResponse = await ai.models.generateContent({
-      model: TEST_PROMPT_MODEL,
+      model: REPORT_MODEL,
       contents: buildGroundedSelectionPrompt({
         ...input,
         candidateResources: groundedCandidateResources,

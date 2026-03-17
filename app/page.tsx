@@ -1,66 +1,33 @@
 "use client";
 
 import { useEffect, useEffectEvent, useRef, useState } from "react";
+import {
+  ActivityHandling,
+  MediaResolution,
+  Modality,
+  type LiveServerMessage,
+  type Session,
+} from "@google/genai";
 import { ReportMarkdown } from "./components/ReportMarkdown";
+import { getGeminiClient } from "@/lib/gemini/client";
+import { generateReviewReport } from "@/lib/gemini/report";
+import { ART_DIRECTOR_AI_SYSTEM_PROMPT } from "@/lib/gemini/systemPrompt";
+import { LIVE_MODEL } from "@/lib/gemini/models";
 
-type BackendStatus = "idle" | "success" | "error";
 type MicrophoneStatus = "idle" | "ready" | "denied" | "error";
 type ScreenShareStatus = "idle" | "sharing" | "denied" | "error";
 type LiveReviewSession = {
   id: string;
   status: string;
 };
-type LiveKickoffResponse = {
-  ok: boolean;
-  status: string;
-  reviewStartedAt: string;
-};
-type LiveFrameResponse = {
-  ok: boolean;
-};
 type LiveAudioChunk = {
   data: string;
   mimeType: string;
-};
-type LiveAudioOutputResponse = {
-  chunks: LiveAudioChunk[];
-  interrupted: boolean;
-};
-type BackendLiveTranscriptResponse = {
-  id: string;
-  status: string;
-  userName?: string;
-  reviewStartedAt?: string;
-  transcript: TranscriptMessage[];
-  styleTarget?: string;
-  assetType?: string;
-  reviewedParts: string[];
-  visibilityLimitations: string[];
-  findings: Array<{
-    area: string;
-    issue: string;
-    severity: "High" | "Medium" | "Low";
-    whyItHurtsQuality: string;
-    improvementDirection: string;
-    practicalNextStep: string;
-  }>;
-  resourceCatalog: string[];
-};
-type ReportResponse = {
-  markdown: string;
 };
 type ReportExportScreenshot = {
   id: string;
   imageDataUrl: string;
   timestamp: string;
-  label?: string;
-};
-type CapturedScreenshot = {
-  id: string;
-  imageDataUrl: string;
-  timestamp: string;
-  width: number;
-  height: number;
   label?: string;
 };
 type TranscriptMessage = {
@@ -73,9 +40,8 @@ type OnboardingStep = "welcome" | "setup" | "review";
 
 const VISUAL_STREAM_MIN_INTERVAL_MS = 1000;
 const LIVE_FRAME_MAX_WIDTH = 1280;
-const LIVE_AUDIO_OUTPUT_POLL_INTERVAL_MS = 250;
-const LIVE_TRANSCRIPT_POLL_INTERVAL_MS = 1000;
-const MICROPHONE_BUFFER_SIZE = 16384;
+const LIVE_FRAME_HASH_WIDTH = 48;
+const LIVE_FRAME_FORCE_SEND_INTERVAL_MS = 5000;
 const MICROPHONE_SPEECH_RMS_THRESHOLD = 0.015;
 const MICROPHONE_SPEECH_HANGOVER_MS = 250;
 const MICROPHONE_SILENCE_END_MS = 900;
@@ -202,40 +168,6 @@ function getScreenShareSetupState(status: ScreenShareStatus): SetupStepState {
   }
 }
 
-function createLocalId() {
-  return typeof crypto !== "undefined" && "randomUUID" in crypto
-    ? crypto.randomUUID()
-    : `${Date.now()}-${Math.random()}`;
-}
-
-function createLocalTimestamp() {
-  return new Date().toLocaleTimeString([], {
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-}
-
-function float32ToBase64Pcm(float32Samples: Float32Array) {
-  const buffer = new ArrayBuffer(float32Samples.length * 2);
-  const view = new DataView(buffer);
-
-  for (let index = 0; index < float32Samples.length; index += 1) {
-    const sample = Math.max(-1, Math.min(1, float32Samples[index]));
-    const pcmValue = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
-
-    view.setInt16(index * 2, pcmValue, true);
-  }
-
-  let binary = "";
-  const bytes = new Uint8Array(buffer);
-
-  for (const byte of bytes) {
-    binary += String.fromCharCode(byte);
-  }
-
-  return btoa(binary);
-}
-
 function base64ToUint8Array(base64: string) {
   const binary = atob(base64);
   const bytes = new Uint8Array(binary.length);
@@ -259,22 +191,25 @@ function parseSampleRateFromMimeType(mimeType: string, fallbackRate: number) {
   return Number.isFinite(parsedRate) ? parsedRate : fallbackRate;
 }
 
-function getSignalRms(samples: Float32Array) {
-  let sumSquares = 0;
-
-  for (let index = 0; index < samples.length; index += 1) {
-    const sample = samples[index];
-    sumSquares += sample * sample;
-  }
-
-  return Math.sqrt(sumSquares / samples.length);
+function buildKickoffPrompt(userName: string) {
+  const sanitized = userName.replace(/[^a-zA-Z0-9 '\-]/g, "").trim().slice(0, 50) || "there";
+  return [
+    `The user's name is ${sanitized}.`,
+    "",
+    "Start the session by greeting them warmly and professionally.",
+    "",
+    "Briefly introduce yourself as a live Art Director AI for 3D game art, but friends call you Adai.",
+    "Then ask them to show the 3D model they want to review today.",
+    "",
+    "Keep it natural, short, and conversational.",
+  ].join("\n");
 }
 
 export default function Home() {
+  const [apiKey, setApiKey] = useState<string | null>(null);
+  const [apiKeyError, setApiKeyError] = useState(false);
   const [onboardingStep, setOnboardingStep] = useState<OnboardingStep>("welcome");
   const [userName, setUserName] = useState("");
-  const [isHydratingOnboarding, setIsHydratingOnboarding] = useState(true);
-  const [backendStatus] = useState<BackendStatus>("idle");
   const [microphoneStatus, setMicrophoneStatus] =
     useState<MicrophoneStatus>("idle");
   const [screenShareStatus, setScreenShareStatus] =
@@ -298,19 +233,16 @@ export default function Home() {
   const [reviewStartedAt, setReviewStartedAt] = useState<string | null>(null);
   const [reportReadyCountdownMs, setReportReadyCountdownMs] = useState(0);
   const [screenStream, setScreenStream] = useState<MediaStream | null>(null);
-  const [capturedScreenshots] = useState<CapturedScreenshot[]>([]);
   const [generatedReport, setGeneratedReport] = useState<string | null>(null);
   const [reportScreenshots, setReportScreenshots] = useState<
     ReportExportScreenshot[]
   >([]);
-  const [, setTranscriptMessages] = useState<TranscriptMessage[]>([]);
+  const [transcript, setTranscript] = useState<TranscriptMessage[]>([]);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const isSendingLiveFrameRef = useRef(false);
-  const isSendingMicrophoneAudioRef = useRef(false);
-  const isPollingLiveAudioOutputRef = useRef(false);
-  const isSyncingLiveTranscriptRef = useRef(false);
+  const lastSentFrameHashRef = useRef(0);
+  const lastForcedFrameSentAtRef = useRef(0);
   const isFinishingReviewRef = useRef(false);
-  const hasLoggedScreenShareStartedRef = useRef<string | null>(null);
   const lastVisualFrameSentAtRef = useRef(0);
   const lastDetectedSpeechAtRef = useRef<number | null>(null);
   const hasSentAudioStreamEndRef = useRef(true);
@@ -319,11 +251,19 @@ export default function Home() {
   const activePlaybackSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const playbackAudioContextRef = useRef<AudioContext | null>(null);
   const nextPlaybackTimeRef = useRef(0);
+  const geminiSessionRef = useRef<Session | null>(null);
+  const pendingInputRef = useRef<string | null>(null);
+  const pendingOutputRef = useRef<string | null>(null);
+  const playLiveAudioChunkImplRef = useRef<(chunk: LiveAudioChunk) => Promise<void>>(async () => {});
+  const handleLiveMessageImplRef = useRef<(message: LiveServerMessage) => void>(() => {});
+  const handleLiveCloseImplRef = useRef<() => void>(() => {});
+  // Stable wrappers created once — captured by the SDK at connect time, delegate to impl refs updated each render.
+  const stableHandleLiveMessage = useRef((msg: LiveServerMessage) => handleLiveMessageImplRef.current(msg));
+  const stableHandleLiveClose = useRef(() => handleLiveCloseImplRef.current());
 
   const isVisualStreamingActive =
     liveReviewSession?.status === "connected" && Boolean(screenStream);
   const isReviewScreenVisible = onboardingStep === "review";
-  const liveReviewSessionId = liveReviewSession?.id ?? null;
   const isLiveReviewConnected = liveReviewSession?.status === "connected";
   const isReportReady =
     Boolean(reviewStartedAt) && reportReadyCountdownMs <= 0;
@@ -332,25 +272,34 @@ export default function Home() {
   const isScreenReady = screenShareStatus === "sharing";
   const isSetupReady = isMicrophoneReady && isScreenReady;
 
-  function markLiveReviewSessionMissing() {
-    if (isFinishingReviewRef.current) {
-      setLiveReviewSession(null);
-      setReviewStartedAt(null);
-      return;
+  function clearLiveAudioPlayback() {
+    for (const source of activePlaybackSourcesRef.current) {
+      try {
+        source.stop();
+      } catch {
+        // Ignore sources that are already stopped.
+      }
+
+      source.disconnect();
     }
 
-    setLiveReviewSession(null);
-    setReviewStartedAt(null);
-    setLiveReviewError(
-      "Live review session ended on the backend. Click Connect Live Review again.",
-    );
-    setLiveAudioError(null);
-    addTranscriptMessage("system", "Live Gemini review disconnected.");
+    activePlaybackSourcesRef.current.clear();
+
+    const audioContext = playbackAudioContextRef.current;
+    nextPlaybackTimeRef.current = audioContext ? audioContext.currentTime : 0;
   }
 
-  const handleMissingLiveSessionInEffect = useEffectEvent(() => {
-    markLiveReviewSessionMissing();
-  });
+  function appendTranscriptItem(role: "user" | "assistant", text: string) {
+    setTranscript((prev) => [
+      ...prev,
+      {
+        id: crypto.randomUUID(),
+        role,
+        text,
+        timestamp: new Date().toISOString(),
+      },
+    ]);
+  }
 
   useEffect(() => {
     const storedUserName = window.localStorage
@@ -362,7 +311,16 @@ export default function Home() {
       setOnboardingStep("setup");
     }
 
-    setIsHydratingOnboarding(false);
+    fetch("/api/session")
+      .then((res) => res.json())
+      .then((data: { key?: string; error?: string }) => {
+        if (data.key) {
+          setApiKey(data.key);
+        } else {
+          setApiKeyError(true);
+        }
+      })
+      .catch(() => setApiKeyError(true));
   }, []);
 
   useEffect(() => {
@@ -424,52 +382,6 @@ export default function Home() {
     };
   }, [reviewStartedAt]);
 
-  useEffect(() => {
-    if (!isLiveReviewConnected || !liveReviewSessionId) {
-      return;
-    }
-
-    const currentLiveReviewSessionId = liveReviewSessionId;
-    let isCancelled = false;
-
-    async function syncTranscript() {
-      if (isCancelled) {
-        return;
-      }
-
-      await syncLiveTranscriptInEffect(currentLiveReviewSessionId);
-    }
-
-    void syncTranscript();
-
-    const intervalId = window.setInterval(() => {
-      void syncTranscript();
-    }, LIVE_TRANSCRIPT_POLL_INTERVAL_MS);
-
-    return () => {
-      isCancelled = true;
-      window.clearInterval(intervalId);
-    };
-  }, [isLiveReviewConnected, liveReviewSessionId]);
-
-  useEffect(() => {
-    if (!screenStream) {
-      hasLoggedScreenShareStartedRef.current = null;
-      return;
-    }
-
-    if (
-      !liveReviewSessionId ||
-      screenShareStatus !== "sharing" ||
-      hasLoggedScreenShareStartedRef.current === liveReviewSessionId
-    ) {
-      return;
-    }
-
-    hasLoggedScreenShareStartedRef.current = liveReviewSessionId;
-    void logLiveSystemEventInEffect("Screen share started.");
-  }, [liveReviewSessionId, screenShareStatus, screenStream]);
-
   async function ensureMicrophoneReady() {
     if (microphoneStream) {
       setMicrophoneStatus("ready");
@@ -516,142 +428,6 @@ export default function Home() {
   async function handleEnableMicrophone() {
     await ensureMicrophoneReady();
   }
-
-  function addTranscriptMessage(
-    role: TranscriptMessage["role"],
-    text: string,
-  ) {
-    const message: TranscriptMessage = {
-      id: createLocalId(),
-      role,
-      text,
-      timestamp: createLocalTimestamp(),
-    };
-
-    setTranscriptMessages((currentMessages) => [...currentMessages, message]);
-  }
-
-  function mergeTranscriptMessages(messages: TranscriptMessage[]) {
-    setTranscriptMessages((currentMessages) => {
-      const existingMessageIds = new Set(
-        currentMessages.map((message) => message.id),
-      );
-      const nextMessages = [...currentMessages];
-
-      for (const message of messages) {
-        if (!existingMessageIds.has(message.id)) {
-          nextMessages.push(message);
-          existingMessageIds.add(message.id);
-        }
-      }
-
-      return nextMessages;
-    });
-  }
-
-  async function syncLiveTranscriptWithBackend(
-    sessionId: string,
-    options?: { suppressErrors?: boolean },
-  ) {
-    if (isSyncingLiveTranscriptRef.current) {
-      return;
-    }
-
-    isSyncingLiveTranscriptRef.current = true;
-
-    try {
-      const response = await fetch(
-        `https://artdirectorai-backend-9279022099.us-central1.run.app/live/${sessionId}/transcript`,
-      );
-      const data = (await response.json()) as
-        | BackendLiveTranscriptResponse
-        | { error?: string };
-
-      if (!response.ok || !("transcript" in data)) {
-        if (response.status === 404) {
-          if (!isFinishingReviewRef.current) {
-            markLiveReviewSessionMissing();
-          }
-
-          return;
-        }
-
-        throw new Error(
-          "error" in data && data.error
-            ? data.error
-            : "Could not sync live transcript from the backend.",
-        );
-      }
-
-      setReviewStartedAt(data.reviewStartedAt || null);
-      mergeTranscriptMessages(data.transcript);
-    } catch (error) {
-      if (!options?.suppressErrors) {
-        setLiveReviewError(
-          error instanceof Error
-            ? error.message
-            : "Could not sync live transcript from the backend.",
-        );
-      }
-    } finally {
-      isSyncingLiveTranscriptRef.current = false;
-    }
-  }
-
-  async function logLiveSystemEvent(text: string) {
-    if (!liveReviewSessionId) {
-      return;
-    }
-
-    try {
-      const response = await fetch(
-        `https://artdirectorai-backend-9279022099.us-central1.run.app/live/${liveReviewSessionId}/events`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({ text }),
-        },
-      );
-
-      if (!response.ok) {
-        const data = (await response.json().catch(() => null)) as
-          | { error?: string }
-          | null;
-
-        if (response.status === 404) {
-          if (!isFinishingReviewRef.current) {
-            markLiveReviewSessionMissing();
-          }
-
-          return;
-        }
-
-        throw new Error(data?.error || "Could not log the live review event.");
-      }
-
-      await syncLiveTranscriptWithBackend(liveReviewSessionId, {
-        suppressErrors: true,
-      });
-    } catch (error) {
-      console.warn(
-        error instanceof Error
-          ? error.message
-          : "Could not log the live review event.",
-      );
-    }
-  }
-
-  const syncLiveTranscriptInEffect = useEffectEvent(async (sessionId: string) => {
-    await syncLiveTranscriptWithBackend(sessionId, {
-      suppressErrors: true,
-    });
-  });
-
-  const logLiveSystemEventInEffect = useEffectEvent(async (text: string) => {
-    await logLiveSystemEvent(text);
-  });
 
   function captureCurrentScreenCanvas(options?: { maxWidth?: number }) {
     const videoElement = videoRef.current;
@@ -714,367 +490,8 @@ export default function Home() {
     setOnboardingStep("welcome");
   }
 
-  async function ensureLiveReviewConnected() {
-    if (liveReviewSession?.status === "connected") {
-      return liveReviewSession;
-    }
-
-    setIsConnectingLiveReview(true);
-    setLiveReviewError(null);
-    setLiveMessageError(null);
-    setLiveFrameError(null);
-    setLiveAudioError(null);
-
-    try {
-      const response = await fetch("https://artdirectorai-backend-9279022099.us-central1.run.app/live/session", {
-        method: "POST",
-      });
-      const data = (await response.json()) as
-        | LiveReviewSession
-        | { error?: string };
-
-      if (!response.ok || !("id" in data)) {
-        throw new Error(
-          "error" in data && data.error
-            ? data.error
-            : "Live Gemini connection failed.",
-        );
-      }
-
-      setLiveReviewSession(data);
-      await syncLiveTranscriptWithBackend(data.id, {
-        suppressErrors: true,
-      });
-      return data;
-    } catch (error) {
-      setLiveReviewSession(null);
-      setLiveReviewError(
-        error instanceof Error
-          ? error.message
-          : "Live Gemini connection failed.",
-      );
-      return null;
-    } finally {
-      setIsConnectingLiveReview(false);
-    }
-  }
-
-  async function ensureLiveReviewKickoffStarted(liveSessionId: string) {
-    if (!liveSessionId) {
-      setLiveReviewError("Live review session is not connected.");
-      return false;
-    }
-
-    const normalizedUserName = userName.trim();
-
-    if (!normalizedUserName) {
-      setLiveReviewError("Your name is required before review can start.");
-      setOnboardingStep("welcome");
-      return false;
-    }
-
-    setIsSendingKickoff(true);
-    setLiveReviewError(null);
-
-    try {
-      const response = await fetch(
-        `https://artdirectorai-backend-9279022099.us-central1.run.app/live/${liveSessionId}/kickoff`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            userName: normalizedUserName,
-          }),
-        },
-      );
-      const data = (await response.json()) as
-        | LiveKickoffResponse
-        | { error?: string };
-
-      if (!response.ok || !("reviewStartedAt" in data)) {
-        if (response.status === 404) {
-          markLiveReviewSessionMissing();
-        }
-
-        throw new Error(
-          "error" in data && data.error
-            ? data.error
-            : "Could not start the review conversation.",
-        );
-      }
-
-      persistUserName(normalizedUserName);
-      setReviewStartedAt(data.reviewStartedAt);
-      await syncLiveTranscriptWithBackend(liveSessionId, {
-        suppressErrors: true,
-      });
-      return true;
-    } catch (error) {
-      setLiveReviewError(
-        error instanceof Error
-          ? error.message
-          : "Could not start the review conversation.",
-      );
-      return false;
-    } finally {
-      setIsSendingKickoff(false);
-    }
-  }
-
-  function stopLocalLiveReview() {
-    microphoneStream?.getTracks().forEach((track) => track.stop());
-    screenStream?.getTracks().forEach((track) => track.stop());
-
-    setMicrophoneStream(null);
-    setScreenStream(null);
-    setMicrophoneStatus("idle");
-    setScreenShareStatus("idle");
-    setLiveReviewSession(null);
-    setLiveReviewError(null);
-    setLiveMessageError(null);
-    setLiveFrameError(null);
-    setLiveAudioError(null);
-    setReviewStartedAt(null);
-
-    isSendingLiveFrameRef.current = false;
-    isSendingMicrophoneAudioRef.current = false;
-    isPollingLiveAudioOutputRef.current = false;
-    lastDetectedSpeechAtRef.current = null;
-    hasSentAudioStreamEndRef.current = true;
-    lastLocalBargeInAtRef.current = 0;
-    suppressLiveAudioPlaybackUntilRef.current = 0;
-    clearLiveAudioPlayback();
-
-    const playbackAudioContext = playbackAudioContextRef.current;
-    playbackAudioContextRef.current = null;
-
-    if (playbackAudioContext) {
-      void playbackAudioContext.close().catch(() => undefined);
-    }
-  }
-
-  function clearLiveAudioPlayback() {
-    for (const source of activePlaybackSourcesRef.current) {
-      try {
-        source.stop();
-      } catch {
-        // Ignore sources that are already stopped.
-      }
-
-      source.disconnect();
-    }
-
-    activePlaybackSourcesRef.current.clear();
-
-    const audioContext = playbackAudioContextRef.current;
-    nextPlaybackTimeRef.current = audioContext ? audioContext.currentTime : 0;
-  }
-
-  async function handleFinishReview() {
-    if (!liveReviewSession?.id || isGeneratingReport) {
-      return;
-    }
-
-    const currentLiveReviewSessionId = liveReviewSession.id;
-    const currentScreenshots = capturedScreenshots.map((screenshot) => ({
-      id: screenshot.id,
-      imageDataUrl: screenshot.imageDataUrl,
-      timestamp: screenshot.timestamp,
-      label: screenshot.label,
-    }));
-    const assetMetadata = null;
-
-    isFinishingReviewRef.current = true;
-    setIsGeneratingReport(true);
-    setIsDownloadingPdf(false);
-    setPdfError(null);
-    setReportError(null);
-    setGeneratedReport(null);
-    setReportScreenshots([]);
-
-    try {
-      const finishResponse = await fetch(
-        `https://artdirectorai-backend-9279022099.us-central1.run.app/live/${currentLiveReviewSessionId}/finish`,
-        {
-          method: "POST",
-        },
-      );
-
-      if (!finishResponse.ok && finishResponse.status !== 404) {
-        const finishData = (await finishResponse.json()) as { error?: string };
-
-        throw new Error(
-          finishData.error || "Could not finish the live review session.",
-        );
-      }
-
-      await syncLiveTranscriptWithBackend(currentLiveReviewSessionId, {
-        suppressErrors: true,
-      });
-    } catch (error) {
-      setLiveReviewError(
-        error instanceof Error
-          ? `${error.message} Generating report from the current local review data instead.`
-          : "Could not finish the live review session. Generating report from the current local review data instead.",
-      );
-    } finally {
-      stopLocalLiveReview();
-    }
-
-    try {
-      const response = await fetch("https://artdirectorai-backend-9279022099.us-central1.run.app/report", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          liveReviewSessionId: currentLiveReviewSessionId,
-          assetMetadata,
-          screenshots: currentScreenshots,
-          styleTarget: null,
-        }),
-      });
-      const data = (await response.json()) as ReportResponse | { error?: string };
-
-      if (!response.ok || !("markdown" in data)) {
-        throw new Error(
-          "error" in data && data.error
-            ? data.error
-            : "Report generation failed.",
-        );
-      }
-
-      setGeneratedReport(data.markdown);
-      setReportScreenshots(currentScreenshots);
-    } catch (error) {
-      setReportError(
-        error instanceof Error ? error.message : "Report generation failed.",
-      );
-    } finally {
-      setIsGeneratingReport(false);
-      isFinishingReviewRef.current = false;
-    }
-  }
-
-  async function handleDownloadPdf() {
-    if (!generatedReport || isDownloadingPdf) {
-      return;
-    }
-
-    setIsDownloadingPdf(true);
-    setPdfError(null);
-
-    try {
-      const response = await fetch("https://artdirectorai-backend-9279022099.us-central1.run.app/report/pdf", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          markdown: generatedReport,
-          screenshots: reportScreenshots.map((screenshot) => ({
-            id: screenshot.id,
-            imageDataUrl: screenshot.imageDataUrl,
-            timestamp: screenshot.timestamp,
-            label: screenshot.label,
-          })),
-        }),
-      });
-
-      if (!response.ok) {
-        const errorData = (await response.json().catch(() => null)) as
-          | { error?: string }
-          | null;
-
-        throw new Error(errorData?.error || "PDF generation failed.");
-      }
-
-      const pdfBlob = await response.blob();
-      const downloadUrl = window.URL.createObjectURL(pdfBlob);
-      const downloadLink = document.createElement("a");
-
-      downloadLink.href = downloadUrl;
-      downloadLink.download = "art-director-ai-review.pdf";
-      document.body.appendChild(downloadLink);
-      downloadLink.click();
-      downloadLink.remove();
-      window.URL.revokeObjectURL(downloadUrl);
-    } catch (error) {
-      setPdfError(
-        error instanceof Error ? error.message : "PDF generation failed.",
-      );
-    } finally {
-      setIsDownloadingPdf(false);
-    }
-  }
-
-  async function handleSendCurrentScreenFrame() {
-    if (!liveReviewSession?.id) {
-      setLiveFrameError("Live review session is not connected.");
-      return false;
-    }
-
-    if (isSendingLiveFrameRef.current) {
-      return false;
-    }
-
-    const frame = captureCurrentScreenCanvas({
-      maxWidth: LIVE_FRAME_MAX_WIDTH,
-    });
-
-    if (!frame) {
-      return false;
-    }
-
-    isSendingLiveFrameRef.current = true;
-    try {
-      const response = await fetch(
-        `https://artdirectorai-backend-9279022099.us-central1.run.app/live/${liveReviewSession.id}/frame`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            imageDataUrl: frame.canvas.toDataURL("image/jpeg", 0.8),
-          }),
-        },
-      );
-      const data = (await response.json()) as
-        | LiveFrameResponse
-        | { error?: string };
-
-      if (!response.ok || !("ok" in data) || !data.ok) {
-        if (response.status === 404) {
-          markLiveReviewSessionMissing();
-        }
-
-        throw new Error(
-          "error" in data && data.error
-            ? data.error
-            : "Live screen frame send failed.",
-        );
-      }
-
-      setLiveFrameError(null);
-      return true;
-    } catch (error) {
-      setLiveFrameError(
-        error instanceof Error ? error.message : "Live screen frame send failed.",
-      );
-      return false;
-    } finally {
-      isSendingLiveFrameRef.current = false;
-    }
-  }
-
-  const streamCurrentScreenFrame = useEffectEvent(async () => {
-    return handleSendCurrentScreenFrame();
-  });
-
-  const playLiveAudioChunk = useEffectEvent(async (chunk: LiveAudioChunk) => {
+  // Update impl refs every render so stable wrappers always call the latest closure.
+  playLiveAudioChunkImplRef.current = async (chunk: LiveAudioChunk) => {
     const AudioContextConstructor =
       window.AudioContext ||
       (window as typeof window & { webkitAudioContext?: typeof AudioContext })
@@ -1126,6 +543,326 @@ export default function Home() {
 
     source.start(playbackTime);
     nextPlaybackTimeRef.current = playbackTime + audioBuffer.duration;
+  };
+
+  handleLiveMessageImplRef.current = (message: LiveServerMessage) => {
+    if (message.serverContent?.interrupted) {
+      clearLiveAudioPlayback();
+      suppressLiveAudioPlaybackUntilRef.current = 0;
+    }
+
+    // Audio output — play directly (skip during barge-in suppression)
+    if (performance.now() >= suppressLiveAudioPlaybackUntilRef.current) {
+      const parts = message.serverContent?.modelTurn?.parts ?? [];
+      for (const part of parts) {
+        const inlineData = part.inlineData;
+        if (
+          inlineData?.data &&
+          typeof inlineData.data === "string" &&
+          typeof inlineData.mimeType === "string" &&
+          inlineData.mimeType.startsWith("audio/")
+        ) {
+          void playLiveAudioChunkImplRef.current({ data: inlineData.data, mimeType: inlineData.mimeType });
+        }
+      }
+    }
+
+    // Transcription accumulation
+    const inputT = message.serverContent?.inputTranscription;
+    const outputT = message.serverContent?.outputTranscription;
+
+    if (typeof inputT?.text === "string" && inputT.text.trim()) {
+      pendingInputRef.current = inputT.text.trim();
+    }
+    if (typeof outputT?.text === "string" && outputT.text.trim()) {
+      pendingOutputRef.current = outputT.text.trim();
+    }
+    if (inputT?.finished && pendingInputRef.current) {
+      appendTranscriptItem("user", pendingInputRef.current);
+      pendingInputRef.current = null;
+    }
+    if (outputT?.finished && pendingOutputRef.current) {
+      appendTranscriptItem("assistant", pendingOutputRef.current);
+      pendingOutputRef.current = null;
+    }
+  };
+
+  handleLiveCloseImplRef.current = () => {
+    if (isFinishingReviewRef.current) return;
+    geminiSessionRef.current = null;
+    setLiveReviewSession(null);
+    setReviewStartedAt(null);
+    setLiveReviewError("Live review session closed unexpectedly. Please try starting a new review.");
+  };
+
+  async function startLiveReview(currentApiKey: string) {
+    const normalizedUserName = userName.trim();
+
+    if (!normalizedUserName) {
+      setLiveReviewError("Your name is required before review can start.");
+      setOnboardingStep("welcome");
+      return false;
+    }
+
+    setIsConnectingLiveReview(true);
+    setIsSendingKickoff(true);
+    setLiveReviewError(null);
+    setLiveMessageError(null);
+    setLiveFrameError(null);
+    setLiveAudioError(null);
+
+    try {
+      const ai = getGeminiClient(currentApiKey);
+      const sessionId = crypto.randomUUID();
+
+      const session = await ai.live.connect({
+        model: LIVE_MODEL,
+        config: {
+          mediaResolution: MediaResolution.MEDIA_RESOLUTION_HIGH,
+          inputAudioTranscription: {},
+          outputAudioTranscription: {},
+          realtimeInputConfig: {
+            activityHandling: ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
+          },
+          responseModalities: [Modality.AUDIO],
+          speechConfig: {
+            voiceConfig: {
+              prebuiltVoiceConfig: { voiceName: "Leda" },
+            },
+          },
+          contextWindowCompression: { slidingWindow: {} },
+          systemInstruction: ART_DIRECTOR_AI_SYSTEM_PROMPT,
+        },
+        callbacks: {
+          onmessage: stableHandleLiveMessage.current,
+          onerror: (e: ErrorEvent) =>
+            setLiveReviewError(e.message ?? "Live session error."),
+          onclose: stableHandleLiveClose.current,
+        },
+      });
+
+      geminiSessionRef.current = session;
+
+      session.sendClientContent({
+        turns: buildKickoffPrompt(normalizedUserName),
+        turnComplete: true,
+      });
+
+      persistUserName(normalizedUserName);
+      setTranscript([]);
+      setLiveReviewSession({ id: sessionId, status: "connected" });
+      setReviewStartedAt(new Date().toISOString());
+
+      return true;
+    } catch (error) {
+      geminiSessionRef.current = null;
+      setLiveReviewSession(null);
+      setLiveReviewError(
+        error instanceof Error ? error.message : "Live Gemini connection failed.",
+      );
+      return false;
+    } finally {
+      setIsConnectingLiveReview(false);
+      setIsSendingKickoff(false);
+    }
+  }
+
+  function stopLocalLiveReview() {
+    try {
+      geminiSessionRef.current?.close();
+    } catch {
+      // ignore close errors
+    }
+    geminiSessionRef.current = null;
+
+    microphoneStream?.getTracks().forEach((track) => track.stop());
+    screenStream?.getTracks().forEach((track) => track.stop());
+
+    setMicrophoneStream(null);
+    setScreenStream(null);
+    setMicrophoneStatus("idle");
+    setScreenShareStatus("idle");
+    setLiveReviewSession(null);
+    setLiveReviewError(null);
+    setLiveMessageError(null);
+    setLiveFrameError(null);
+    setLiveAudioError(null);
+    setReviewStartedAt(null);
+
+    isSendingLiveFrameRef.current = false;
+    lastDetectedSpeechAtRef.current = null;
+    hasSentAudioStreamEndRef.current = true;
+    lastLocalBargeInAtRef.current = 0;
+    suppressLiveAudioPlaybackUntilRef.current = 0;
+    clearLiveAudioPlayback();
+
+    const playbackAudioContext = playbackAudioContextRef.current;
+    playbackAudioContextRef.current = null;
+
+    if (playbackAudioContext) {
+      void playbackAudioContext.close().catch(() => undefined);
+    }
+  }
+
+  async function handleFinishReview() {
+    if (!liveReviewSession?.id || isGeneratingReport) {
+      return;
+    }
+
+    const currentTranscript = transcript;
+    const currentSessionId = liveReviewSession.id;
+
+    isFinishingReviewRef.current = true;
+    setIsGeneratingReport(true);
+    setIsDownloadingPdf(false);
+    setPdfError(null);
+    setReportError(null);
+    setGeneratedReport(null);
+    setReportScreenshots([]);
+
+    stopLocalLiveReview();
+
+    try {
+      const report = await generateReviewReport(
+        {
+          sessionState: {
+            id: currentSessionId,
+            assetName: undefined,
+            assetType: undefined,
+            styleTarget: undefined,
+            transcript: currentTranscript,
+            reviewedParts: [],
+            visibilityLimitations: [],
+            findings: [],
+            resourceCatalog: [],
+          },
+          screenshots: [],
+          assetMetadata: null,
+          styleTarget: null,
+        },
+        apiKey!,
+      );
+
+      setGeneratedReport(report.markdown);
+      setReportScreenshots([]);
+    } catch (error) {
+      setReportError(
+        error instanceof Error ? error.message : "Report generation failed.",
+      );
+    } finally {
+      setIsGeneratingReport(false);
+      isFinishingReviewRef.current = false;
+    }
+  }
+
+  async function handleDownloadPdf() {
+    if (!generatedReport || isDownloadingPdf) {
+      return;
+    }
+
+    setIsDownloadingPdf(true);
+    setPdfError(null);
+
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const html2pdf = (await import("html2pdf.js" as any)).default;
+      const reportElement = document.getElementById("report-pdf-content");
+
+      if (!reportElement) {
+        throw new Error("Report element not found.");
+      }
+
+      await html2pdf()
+        .set({
+          margin: [15, 15],
+          filename: "art-director-ai-review.pdf",
+          html2canvas: { scale: 2 },
+          jsPDF: { unit: "mm", format: "a4", orientation: "portrait" },
+        })
+        .from(reportElement)
+        .save();
+    } catch (error) {
+      setPdfError(
+        error instanceof Error ? error.message : "PDF generation failed.",
+      );
+    } finally {
+      setIsDownloadingPdf(false);
+    }
+  }
+
+  function computeFrameHash(videoElement: HTMLVideoElement): number {
+    const hashHeight = Math.round(
+      LIVE_FRAME_HASH_WIDTH * (videoElement.videoHeight / videoElement.videoWidth),
+    );
+    const canvas = document.createElement("canvas");
+    canvas.width = LIVE_FRAME_HASH_WIDTH;
+    canvas.height = hashHeight;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return 0;
+    ctx.drawImage(videoElement, 0, 0, LIVE_FRAME_HASH_WIDTH, hashHeight);
+    const data = ctx.getImageData(0, 0, LIVE_FRAME_HASH_WIDTH, hashHeight).data;
+    let hash = 0;
+    for (let i = 0; i < data.length; i += 16) {
+      hash = (Math.imul(hash, 31) + data[i]) | 0;
+    }
+    return hash;
+  }
+
+  async function handleSendCurrentScreenFrame() {
+    if (!liveReviewSession?.id) {
+      setLiveFrameError("Live review session is not connected.");
+      return false;
+    }
+
+    if (isSendingLiveFrameRef.current) {
+      return false;
+    }
+
+    const videoElement = videoRef.current;
+
+    if (videoElement && videoElement.videoWidth && videoElement.videoHeight) {
+      const now = performance.now();
+      const hash = computeFrameHash(videoElement);
+      const isForced = now - lastForcedFrameSentAtRef.current >= LIVE_FRAME_FORCE_SEND_INTERVAL_MS;
+
+      if (hash === lastSentFrameHashRef.current && !isForced) {
+        return false;
+      }
+
+      lastSentFrameHashRef.current = hash;
+      if (isForced) {
+        lastForcedFrameSentAtRef.current = now;
+      }
+    }
+
+    const frame = captureCurrentScreenCanvas({
+      maxWidth: LIVE_FRAME_MAX_WIDTH,
+    });
+
+    if (!frame) {
+      return false;
+    }
+
+    isSendingLiveFrameRef.current = true;
+    try {
+      const base64 = frame.canvas.toDataURL("image/jpeg", 0.8).split(",")[1];
+      geminiSessionRef.current?.sendRealtimeInput({
+        video: { data: base64, mimeType: "image/jpeg" },
+      });
+      setLiveFrameError(null);
+      return true;
+    } catch (error) {
+      setLiveFrameError(
+        error instanceof Error ? error.message : "Live screen frame send failed.",
+      );
+      return false;
+    } finally {
+      isSendingLiveFrameRef.current = false;
+    }
+  }
+
+  const streamCurrentScreenFrame = useEffectEvent(async () => {
+    return handleSendCurrentScreenFrame();
   });
 
   useEffect(() => {
@@ -1207,88 +944,7 @@ export default function Home() {
   }, [isReviewScreenVisible, isVisualStreamingActive]);
 
   useEffect(() => {
-    if (!isLiveReviewConnected || !liveReviewSessionId) {
-      return;
-    }
-
-    let isCancelled = false;
-
-    async function pollLiveAudioOutput() {
-      if (isPollingLiveAudioOutputRef.current) {
-        return;
-      }
-
-      isPollingLiveAudioOutputRef.current = true;
-
-      try {
-        const response = await fetch(
-          `https://artdirectorai-backend-9279022099.us-central1.run.app/live/${liveReviewSessionId}/audio-output`,
-        );
-        const data = (await response.json()) as
-          | LiveAudioOutputResponse
-          | { error?: string };
-
-        if (!response.ok || !("chunks" in data)) {
-          if (response.status === 404) {
-            handleMissingLiveSessionInEffect();
-          }
-
-          throw new Error(
-            "error" in data && data.error
-              ? data.error
-              : "Live audio playback failed.",
-          );
-        }
-
-        if (data.interrupted) {
-          clearLiveAudioPlayback();
-          suppressLiveAudioPlaybackUntilRef.current = 0;
-        }
-
-        if (performance.now() < suppressLiveAudioPlaybackUntilRef.current) {
-          if (data.chunks.length > 0) {
-            setLiveAudioError(null);
-          }
-
-          return;
-        }
-
-        for (const chunk of data.chunks) {
-          if (isCancelled) {
-            break;
-          }
-
-          await playLiveAudioChunk(chunk);
-        }
-
-        if (data.chunks.length > 0) {
-          setLiveAudioError(null);
-        }
-      } catch (error) {
-        if (!isCancelled) {
-          setLiveAudioError(
-            error instanceof Error ? error.message : "Live audio playback failed.",
-          );
-        }
-      } finally {
-        isPollingLiveAudioOutputRef.current = false;
-      }
-    }
-
-    void pollLiveAudioOutput();
-
-    const intervalId = window.setInterval(() => {
-      void pollLiveAudioOutput();
-    }, LIVE_AUDIO_OUTPUT_POLL_INTERVAL_MS);
-
-    return () => {
-      isCancelled = true;
-      window.clearInterval(intervalId);
-    };
-  }, [isLiveReviewConnected, liveReviewSessionId]);
-
-  useEffect(() => {
-    if (!microphoneStream || !isLiveReviewConnected || !liveReviewSessionId) {
+    if (!microphoneStream || !isLiveReviewConnected) {
       return;
     }
 
@@ -1304,43 +960,26 @@ export default function Home() {
 
     const audioContext = new AudioContextConstructor();
     const source = audioContext.createMediaStreamSource(microphoneStream);
-    const processor = audioContext.createScriptProcessor(
-      MICROPHONE_BUFFER_SIZE,
-      1,
-      1,
-    );
+    let processor: AudioWorkletNode | null = null;
+    let isCancelled = false;
 
-    lastDetectedSpeechAtRef.current = null;
-    hasSentAudioStreamEndRef.current = true;
-
-    processor.onaudioprocess = (event) => {
-      event.outputBuffer.getChannelData(0).fill(0);
-
-      if (!isLiveReviewConnected) {
+    const handleAudioChunk = (event: MessageEvent<{ data: string; rms: number }>) => {
+      if (isCancelled || !isLiveReviewConnected) {
         return;
       }
 
-      const inputChannel = event.inputBuffer.getChannelData(0);
+      const { data, rms } = event.data;
       const now = performance.now();
-      const rms = getSignalRms(inputChannel);
       const isSpeechDetected = rms >= MICROPHONE_SPEECH_RMS_THRESHOLD;
 
-      if (isSpeechDetected) {
-        lastDetectedSpeechAtRef.current = now;
-        hasSentAudioStreamEndRef.current = false;
-      }
-
-      const isWithinSpeechHangover =
-        lastDetectedSpeechAtRef.current !== null &&
-        now - lastDetectedSpeechAtRef.current < MICROPHONE_SPEECH_HANGOVER_MS;
-      const shouldStreamAudioChunk =
-        isSpeechDetected || isWithinSpeechHangover;
+      // Local barge-in: mute model playback when user starts speaking.
+      // Gemini handles the actual interruption server-side via activityHandling.
       const hasQueuedModelAudio =
         activePlaybackSourcesRef.current.size > 0 ||
         nextPlaybackTimeRef.current - audioContext.currentTime > 0.05;
 
       if (
-        shouldStreamAudioChunk &&
+        isSpeechDetected &&
         hasQueuedModelAudio &&
         now - lastLocalBargeInAtRef.current > 150
       ) {
@@ -1350,105 +989,42 @@ export default function Home() {
         clearLiveAudioPlayback();
       }
 
-      if (
-        !shouldStreamAudioChunk &&
-        lastDetectedSpeechAtRef.current !== null &&
-        !hasSentAudioStreamEndRef.current &&
-        now - lastDetectedSpeechAtRef.current >= MICROPHONE_SILENCE_END_MS &&
-        !isSendingMicrophoneAudioRef.current
-      ) {
-        hasSentAudioStreamEndRef.current = true;
-        isSendingMicrophoneAudioRef.current = true;
-
-        void fetch(`https://artdirectorai-backend-9279022099.us-central1.run.app/live/${liveReviewSessionId}/audio-end`, {
-          method: "POST",
-        })
-          .then(async (response) => {
-            const data = (await response.json()) as { error?: string };
-
-            if (!response.ok) {
-              if (response.status === 404) {
-                handleMissingLiveSessionInEffect();
-              }
-
-              throw new Error(data.error || "Live microphone streaming failed.");
-            }
-
-            setLiveAudioError(null);
-          })
-          .catch((error) => {
-            setLiveAudioError(
-              error instanceof Error
-                ? error.message
-                : "Live microphone streaming failed.",
-            );
-          })
-          .finally(() => {
-            isSendingMicrophoneAudioRef.current = false;
-          });
-      }
-
-      if (!shouldStreamAudioChunk || isSendingMicrophoneAudioRef.current) {
-        return;
-      }
-
-      const audioChunk = {
-        data: float32ToBase64Pcm(new Float32Array(inputChannel)),
-        mimeType: `audio/pcm;rate=${audioContext.sampleRate}`,
-      };
-
-      isSendingMicrophoneAudioRef.current = true;
-
-      void fetch(`https://artdirectorai-backend-9279022099.us-central1.run.app/live/${liveReviewSessionId}/audio`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(audioChunk),
-      })
-        .then(async (response) => {
-          const data = (await response.json()) as { error?: string };
-
-          if (!response.ok) {
-            if (response.status === 404) {
-              handleMissingLiveSessionInEffect();
-            }
-
-            throw new Error(data.error || "Live microphone streaming failed.");
-          }
-
-          setLiveAudioError(null);
-        })
-        .catch((error) => {
-          setLiveAudioError(
-            error instanceof Error
-              ? error.message
-              : "Live microphone streaming failed.",
-          );
-        })
-        .finally(() => {
-          isSendingMicrophoneAudioRef.current = false;
+      // Always send audio — Gemini's server-side VAD detects speech start/end.
+      // Filtering here would prevent Gemini from hearing the silence→speech
+      // transition it needs to trigger a response.
+      try {
+        geminiSessionRef.current?.sendRealtimeInput({
+          audio: { data, mimeType: "audio/pcm;rate=16000" },
         });
+      } catch (error) {
+        setLiveAudioError(
+          error instanceof Error ? error.message : "Live microphone streaming failed.",
+        );
+      }
     };
 
-    source.connect(processor);
-    processor.connect(audioContext.destination);
-    void audioContext.resume();
+    void audioContext.audioWorklet
+      .addModule("/audio-processor.worklet.js")
+      .then(() => {
+        if (isCancelled) return;
+        processor = new AudioWorkletNode(audioContext, "audio-processor");
+        processor.port.onmessage = handleAudioChunk;
+        source.connect(processor);
+        void audioContext.resume();
+      })
+      .catch(() => {
+        if (!isCancelled) {
+          setLiveAudioError("Browser microphone streaming is unavailable.");
+        }
+      });
 
     return () => {
-      if (!hasSentAudioStreamEndRef.current && liveReviewSessionId) {
-        void fetch(`https://artdirectorai-backend-9279022099.us-central1.run.app/live/${liveReviewSessionId}/audio-end`, {
-          method: "POST",
-        }).catch(() => undefined);
-      }
-
-      hasSentAudioStreamEndRef.current = true;
-      lastDetectedSpeechAtRef.current = null;
-      processor.disconnect();
+      isCancelled = true;
+      processor?.disconnect();
       source.disconnect();
       void audioContext.close();
     };
-  }, [isLiveReviewConnected, liveReviewSessionId, microphoneStream]);
+  }, [isLiveReviewConnected, microphoneStream]);
 
   async function ensureScreenShareReady() {
     if (screenStream) {
@@ -1502,6 +1078,21 @@ export default function Home() {
       return;
     }
 
+    // Create and resume AudioContext synchronously within the user gesture so
+    // the browser doesn't block playback later (autoplay policy).
+    const AudioContextConstructor =
+      window.AudioContext ||
+      (window as typeof window & { webkitAudioContext?: typeof AudioContext })
+        .webkitAudioContext;
+    if (AudioContextConstructor) {
+      if (!playbackAudioContextRef.current) {
+        playbackAudioContextRef.current = new AudioContextConstructor();
+      }
+      if (playbackAudioContextRef.current.state === "suspended") {
+        void playbackAudioContextRef.current.resume();
+      }
+    }
+
     setIsStartingLiveReview(true);
     setLiveReviewError(null);
     setLiveAudioError(null);
@@ -1528,27 +1119,17 @@ export default function Home() {
         return;
       }
 
-      const liveConnected = await ensureLiveReviewConnected();
+      const started = await startLiveReview(apiKey!);
 
-      if (!liveConnected) {
+      if (!started) {
         setOnboardingStep("setup");
-        return;
-      }
-
-      const kickoffStarted = await ensureLiveReviewKickoffStarted(
-        liveConnected.id,
-      );
-
-      if (!kickoffStarted) {
-        setOnboardingStep("setup");
-        return;
       }
     } finally {
       setIsStartingLiveReview(false);
     }
   }
 
-  if (isHydratingOnboarding) {
+  if (apiKeyError || !apiKey) {
     return (
       <main className="flex min-h-screen items-center justify-center bg-zinc-100 px-6 py-16">
         <section className="w-full max-w-2xl rounded-3xl border border-zinc-200 bg-white p-10 shadow-sm">
@@ -1557,10 +1138,10 @@ export default function Home() {
               Adai
             </p>
             <h1 className="text-4xl font-semibold tracking-tight text-zinc-950 sm:text-5xl">
-              Preparing your live review
+              Service unavailable
             </h1>
             <p className="text-base leading-7 text-zinc-600 sm:text-lg">
-              Loading your setup preferences.
+              Could not connect to the service. Please try again later.
             </p>
           </div>
         </section>
@@ -1647,20 +1228,6 @@ export default function Home() {
       },
     ];
     const setupMessages: Array<{ tone: "success" | "error"; text: string }> = [];
-
-    if (backendStatus === "success") {
-      setupMessages.push({
-        tone: "success",
-        text: "Backend connected.",
-      });
-    }
-
-    if (backendStatus === "error") {
-      setupMessages.push({
-        tone: "error",
-        text: "Backend check failed. Make sure the backend is running.",
-      });
-    }
 
     if (liveReviewError) {
       setupMessages.push({
@@ -1887,7 +1454,7 @@ export default function Home() {
                         Preview
                       </p>
                     </div>
-                    <div className="mt-4 max-h-[420px] space-y-6 overflow-y-auto pr-2">
+                    <div id="report-pdf-content" className="mt-4 max-h-[420px] space-y-6 overflow-y-auto pr-2">
                       <ReportMarkdown markdown={generatedReport} />
                     </div>
                   </div>
